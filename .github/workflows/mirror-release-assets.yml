@@ -1,0 +1,75 @@
+name: Mirror upstream release assets
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mirror-release-assets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download, verify, and upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REPO: Santoshkurmi/antigem
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          releases="$(gh api "repos/${SOURCE_REPO}/releases?per_page=100")"
+          release_count="$(jq 'length' <<<"$releases")"
+          if [[ "$release_count" -ne 24 ]]; then
+            echo "Expected 24 upstream releases, found ${release_count}." >&2
+            exit 1
+          fi
+
+          asset_count=0
+          while IFS= read -r tag; do
+            release="$(jq -c --arg tag "$tag" '.[] | select(.tag_name == $tag)' <<<"$releases")"
+            destination="${RUNNER_TEMP}/antigem-assets/${tag}"
+            mkdir -p "$destination"
+
+            while IFS= read -r asset; do
+              name="$(jq -r '.name' <<<"$asset")"
+              expected_size="$(jq -r '.size' <<<"$asset")"
+              expected_digest="$(jq -r '.digest // empty' <<<"$asset")"
+
+              gh release download "$tag" \
+                --repo "$SOURCE_REPO" \
+                --pattern "$name" \
+                --dir "$destination"
+
+              file="${destination}/${name}"
+              if [[ ! -f "$file" ]]; then
+                echo "Missing downloaded asset: ${tag}/${name}" >&2
+                exit 1
+              fi
+
+              actual_size="$(stat -c '%s' "$file")"
+              if [[ "$actual_size" != "$expected_size" ]]; then
+                echo "Size mismatch for ${tag}/${name}: expected ${expected_size}, got ${actual_size}." >&2
+                exit 1
+              fi
+
+              if [[ -n "$expected_digest" ]]; then
+                actual_digest="sha256:$(sha256sum "$file" | awk '{print $1}')"
+                if [[ "$actual_digest" != "$expected_digest" ]]; then
+                  echo "SHA-256 mismatch for ${tag}/${name}." >&2
+                  exit 1
+                fi
+              fi
+
+              gh release upload "$tag" "$file" \
+                --repo "$TARGET_REPO" \
+                --clobber
+              asset_count=$((asset_count + 1))
+              echo "Uploaded ${tag}/${name}"
+            done < <(jq -c '.assets[]' <<<"$release")
+          done < <(jq -r '.[].tag_name' <<<"$releases")
+
+          if [[ "$asset_count" -ne 41 ]]; then
+            echo "Expected 41 upstream assets, uploaded ${asset_count}." >&2
+            exit 1
+          fi
